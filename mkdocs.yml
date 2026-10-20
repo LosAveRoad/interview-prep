@@ -1,5 +1,5 @@
 site_name: 面试八股笔记
-site_description: Redis / MySQL、AI Agent、Java / Go、计算机组成原理
+site_description: Redis、MySQL、Go 秒杀、AI Agent、Java、Go、操作系统、计算机网络
 site_url: https://losaveroad.github.io/interview-prep/
 repo_url: https://github.com/LosAveRoad/interview-prep
 repo_name: LosAveRoad/interview-prep
@@ -54,7 +54,7 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
-      toc_depth: 3
+      toc_depth: 6
   - pymdownx.details
   - pymdownx.highlight:
       anchor_linenums: true
@@ -74,7 +74,11 @@ extra_css:
 
 nav:
   - 首页: index.md
-  - Redis & MySQL: redis-mysql.md
+  - Redis: redis.md
+  - MySQL: mysql.md
+  - Go 秒杀: seckill.md
   - AI Agent: agent.md
-  - Java & Go: java-go.md
-  - 计算机组成原理: computer-organization.md
+  - Java: java.md
+  - Go: go.md
+  - 操作系统: os.md
+  - 计算机网络: network.md

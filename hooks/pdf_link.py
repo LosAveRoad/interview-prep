@@ -8,10 +8,14 @@
 from xml.sax.saxutils import escape
 
 PDFS = {
-    "redis-mysql.md": "redis-mysql.pdf",
+    "redis.md": "redis.pdf",
+    "mysql.md": "mysql.pdf",
+    "seckill.md": "seckill.pdf",
     "agent.md": "agent.pdf",
-    "java-go.md": "java-go.pdf",
-    "computer-organization.md": "computer-organization.pdf",
+    "java.md": "java.pdf",
+    "go.md": "go.pdf",
+    "os.md": "os.pdf",
+    "network.md": "network.pdf",
 }
 
 

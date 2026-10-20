@@ -84,10 +84,14 @@ print_pdf() {
 notes=("$@")
 if [[ ${#notes[@]} -eq 0 ]]; then
   notes=(
-    docs/redis-mysql.md
+    docs/redis.md
+    docs/mysql.md
+    docs/seckill.md
     docs/agent.md
-    docs/java-go.md
-    docs/computer-organization.md
+    docs/java.md
+    docs/go.md
+    docs/os.md
+    docs/network.md
   )
 fi
 
@@ -105,7 +109,7 @@ for src in "${notes[@]}"; do
     -t html5 \
     -s \
     --toc \
-    --toc-depth=2 \
+    --toc-depth=3 \
     -H build/style.html \
     --metadata lang=zh \
     -o "$html"
