@@ -1,0 +1,22 @@
+:root {
+  --md-text-font: "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei",
+    "Droid Sans Fallback", sans-serif;
+  --md-code-font: "Noto Sans Mono CJK SC", "Sarasa Mono SC", "JetBrains Mono",
+    "WenQuanYi Micro Hei Mono", "DejaVu Sans Mono", monospace;
+}
+
+.md-typeset pre,
+.md-typeset pre code {
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+.md-typeset pre {
+  overflow-x: auto;
+}
+
+.md-typeset .md-button {
+  margin-right: 0.4rem;
+}
