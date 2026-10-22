@@ -1,214 +1,368 @@
 ---
 title: 上下文压缩与中断恢复
-subtitle: JSONL 会话树、compaction 与 abort
+subtitle: JSONL 树、投影和 AgentSession
 ---
 
 # 上下文压缩与中断恢复
 
 ## 背景
 
-agent-core 的 `Agent.state.messages` 只活在内存里。coding-agent 用两套机制把对话变成可恢复、可裁剪的上下文：
+`@my/session` 把 `Agent` 的 `message_end` 追加成 JSONL 树，并在上下文超过阈值时写入 `compaction` 条目。上游实现是 `packages/coding-agent/src/core/session-manager.ts` 的 `SessionManager`、`buildSessionContext`，以及 `core/compaction/compaction.ts` 的 `shouldCompact`、`prepareCompaction`、`compact`。把事件接到磁盘的是 `core/agent-session.ts`。
 
-- **会话树**：`packages/coding-agent/src/core/session-manager.ts` 的 `SessionManager` 把每条记录追加到 JSONL。`id` / `parentId` 组成树，当前叶子决定 active branch。
-- **压缩**：`packages/coding-agent/src/core/compaction/compaction.ts` 在上下文接近窗口时，把旧消息换成摘要，原文仍留在文件里。`/tree` 切分支时另有 `branch-summarization.ts`，给离开的那条分支写 `BranchSummaryEntry`。
-
-`AgentSession`（`core/agent-session.ts`）把两者接到 `Agent` 上：`message_end` 写盘，`prepareNextTurnWithContext` 在下一轮 assistant 之前调用 `_compactBeforeNextAssistantResponse`。
-
-`packages/durable` 是对照，不是这条路径的实现。它要求可见进度都先提交到存储，进程死在 turn 中间也能从 storage 接着做。coding-agent 没有这个事务，崩溃一致性停在「最后一条完整 JSON 行」。
+`packages/durable` 要求副作用展示之前先提交。本包不这样做。崩溃一致性停在最后一条完整 JSON 行。这个选择在 M2 完成定义里验收，不要半套实现 durable。
 
 ## 目标与非目标
 
 **目标**
 
-- 已完成的 user、assistant、toolResult 在 `message_end` 时追加到磁盘，杀进程后能从叶子重建模型上下文。
-- 用户 abort 时，当前 run 停干净，已落盘的消息保留，未发出的队列回到输入框。
-- 上下文超过阈值时自动压缩，手动 `/compact` 走同一套 `compact()`。
+- 文件格式稳定到字段名。后续里程碑只追加条目，不改已有字段的含义。
+- 打开已有文件能重建 `Agent.state.messages`，并补上悬空 tool call。
 
 **非目标**
 
-- 不保证工具副作用和 tool result 落盘是同一个事务。进程在 `execute()` 中被杀掉时，文件可能停在「assistant 已发出 tool call、结果还没有」。
-- 不在 M2 实现 `pi-durable` 的任务图、文档复制或 Chord 事务。
-- 不把压缩做成删历史。`CompactionEntry` 只改变**以后的模型视图**。UI、导出和计费仍能看到原始条目。
+- 不生成 `branch_summary`。联合类型里保留这个变体，解析时认它，投影时把它转成一条 user 消息。没有 `appendBranchSummary` 方法。
+- 不迁移 v1/v2。`version` 不是 3 的 header 直接抛 `Error("unsupported session version")`。
+- 不 `fsync`。
 
-## 方案
-
-### 文件与版本
-
-默认路径形如 `~/.pi/agent/sessions/--<cwd>--/<timestamp>_<session-id>.jsonl`。路径里的 `/`、`\`、`:` 换成 `-`。
-
-第一行是 header，不进树：
-
-```json
-{"type":"session","version":3,"id":"<uuid>","timestamp":"...","cwd":"/path"}
-```
-
-`CURRENT_SESSION_VERSION` 为 3。v1 是线性历史，v2 引入树，v3 把旧的 `hookMessage` role 改名为 `custom`。`migrateSessionEntries` 在加载时迁到 v3。
-
-文件要到出现第一条 user 或 assistant 才创建。只有模型切换、思考档位、system prompt 的会话留在内存里，避免打开又退出留下空文件（`_hasConversation`）。从 user 消息而不是第一条 assistant 开始落盘，这样第一轮没跑完时 prompt 已经在磁盘上。
-
-追加使用 `appendFileSync` 写一行 JSON。`loadEntriesFromFile` 按行解析，坏行跳过。因此最后一行被写到一半时，恢复会丢掉这一行，而不是拒绝整个会话。这里没有 `fsync`。
-
-### 条目
-
-除 header 外，条目都有 `id`、`parentId`、`timestamp`。`append*` 把新条目的 `parentId` 设为当前叶子，然后叶子前进。从较早的条目开分枝不会改旧记录。
-
-| `type` | 是否进入模型上下文 | 作用 |
-|---|---|---|
-| `message` | 是 | 存一条 `AgentMessage`。system 消息携带 prompt 段和 `toolsAdded` / `toolsRemoved` |
-| `model_change` / `thinking_level_change` | 否，但影响下次请求的设置 | 分支上最新的一条生效 |
-| `compaction` | 变成 system 检查点 + 摘要 | `firstKeptEntryId` 指向仍保留原文的第一条 |
-| `branch_summary` | 变成摘要消息 | `fromId` 是被离开的叶子 |
-| `context_edit` | 自身不产生消息 | 把更早某条从模型视图里删掉或替换正文 |
-| `custom` | 否 | 扩展自己的状态，例如虚拟模型路由状态 |
-| `custom_message` | 是 | 扩展注入的上下文，`display` 控制 UI |
-| `label` / `session_info` / `usage` | 否 | 书签、显示名、非 assistant 的用量 |
-
-`message` 条目的时间戳是 ISO 字符串；嵌套消息的 `timestamp` 是毫秒。assistant 消息带 `provider`、`model`、`usage`、`stopReason`，较新的还带 `thinkingLevel`。
-
-`CompactionSummaryMessage` 和 `BranchSummaryMessage` 不能通过 `appendMessage` 写入。它们必须是顶层 `compaction` / `branch_summary`，方便查找。`appendMessage` 的注释写明了这一点。
-
-### 从叶子重建上下文
-
-`buildContextEntries` 从叶子走到根。路径上如果有 `CompactionEntry`，只用**最新**的一条：
-
-1. 放上这条 compaction。
-2. 保留 `firstKeptEntryId` 到 compaction 之前的非 system 条目。
-3. 保留 compaction 之后的条目。
-
-`buildSessionProjection` 再应用路径上每个目标最新的 `context_edit`。`replacement: null` 表示从模型视图省略；非空则只替换正文。编辑是分支局部的，回到编辑之前的叶子，原文会重新出现。
-
-`buildSessionContext` 在投影上取当前模型和思考档位，并把条目转成消息：compaction 变成完整的 system 检查点加上 `compactionSummary`，`branch_summary` 变成 `branchSummary`，`custom_message` 变成 `CustomMessage`。压缩摘要替换 `firstKeptEntryId` 之前的内容。保留区间里的旧 system 消息不再回放，避免和检查点重复。
-
-`AgentSession._refreshFinalizedContext` 把投影写回 `agent.state.messages`。这是恢复后模型真正看到的数组。
-
-```mermaid
-flowchart LR
-  file[JSONL 全树] --> leaf[当前叶子]
-  leaf --> path[走到根的路径]
-  path --> cut[最新 CompactionEntry]
-  cut --> view[摘要 + firstKept 之后的消息]
-  view --> edits[应用 context_edit]
-  edits --> llm[convertToLlm 后的请求]
-```
-
-### 压缩何时发生
-
-`shouldCompact`：
+## 本模块在仓库中的位置
 
 ```text
-settings.enabled && contextTokens > contextWindow - reserveTokens
+packages/session/
+  package.json
+  tsconfig.json
+  src/index.ts
+  src/types.ts              # 上游 session-manager.ts 的 SessionHeader / SessionEntry
+  src/session-manager.ts    # class SessionManager
+  src/projection.ts         # buildSessionProjection、buildSessionContext
+  src/tokens.ts             # estimateTokens、calculateContextTokens
+  src/compaction.ts         # shouldCompact、prepareCompaction、compact
+  src/agent-session.ts      # class AgentSession
+  test/session-manager.test.ts
+  test/projection.test.ts
+  test/compaction.test.ts
+  test/resume.test.ts
 ```
 
-`DEFAULT_COMPACTION_SETTINGS` 是 `enabled: true`、`reserveTokens: 16384`、`keepRecentTokens: 20000`。`reserveTokens` 只决定何时开始，不决定摘要请求的输出长度。摘要请求会按模型输出上限缩小，使输入加输出仍放得进窗口。
+| 文件 | 职责 |
+|---|---|
+| `types.ts` | 可序列化的条目联合。不含方法 |
+| `session-manager.ts` | 追加、叶子、读写文件。不调用模型 |
+| `projection.ts` | 从叶子走到根，应用最新 compaction 和 context_edit |
+| `tokens.ts` | 计数。`estimateTokens` 用字符数除以 4，再向上取整，最小 1。不要接 tokenizer |
+| `compaction.ts` | 纯函数。摘要由调用方传入的 `SummarizeFn` 生成 |
+| `agent-session.ts` | 持有 `Agent` 和 `SessionManager`。订阅事件、写盘、abort、触发压缩 |
 
-token 数优先用最近一条有效 assistant 的 `usage.totalTokens`（或 input + output + cacheRead + cacheWrite）。`stopReason` 为 `aborted` / `error`，或用量全 0 的消息不算。这条用量之后的消息用 `estimateTokens` 估算后相加。若路径上更晚有 `context_edit` 或 `compaction`，旧 usage 作废，改为按投影重估，避免刚压完又被旧的大 usage 立刻再压一次。
+**依赖**：只 import `@my/agent-core`。路径编码函数在本文件内私有复制一份，算法与总览的 `encodeSessionDir` 一致。不 import `@my/resources`。
 
-触发点在 `AgentSession`，不在 agent-core：
-
-- 多轮 run 里，工具结果追加之后、下一次 assistant 之前，经 `prepareNextTurnWithContext` → `_compactBeforeNextAssistantResponse`。若这批工具 `terminate` 且没有排队消息，则跳过。
-- 新的用户 prompt 之前也会查。
-- provider 报上下文溢出，或过早的 `stopReason: "length"`，可以做**一次** compact-and-retry。
-- 手动 `AgentSession.compact(instructions?)`。
-
-agent-core 的 `runLoop` 在 `prepareNextTurn` 之后、若当时 steering 为空，会再 poll 一次。压缩期间用户打进来的 steering 不会丢，也不会在 `one-at-a-time` 下同一轮送出两条。
-
-### 切点与摘要
-
-`prepareCompaction(pathEntries, settings)` 是纯函数。若路径最后一条已经是 compaction，返回 `undefined`，避免空转。
-
-算法要点：
-
-1. 用 `buildSessionProjection` 得到模型可见条目。上一次 compaction 的摘要作为迭代上下文，摘要区间从它的保留边界开始，而不是从会话开头重算。
-2. 从尾部向前累加估算 token，直到覆盖 `keepRecentTokens`。切点落在 user、assistant、bash、custom message 上，**不**切在 tool result 上，否则 tool call 会和结果拆开。
-3. 正常情况按 user 消息边界切。若单个 user 回合本身超过预算，切点可以落在该回合内部的 assistant 上，这叫 split turn：历史和回合前缀各摘要一次，再用 `---` 拼成一条。
-4. 从被摘要的消息和上一次 compaction 的 `details` 里累计 `readFiles` / `modifiedFiles`（`compaction/utils.ts` 的 `extractFileOpsFromMessage`）。
-5. `compact()` 调用模型生成摘要。摘要请求不写 prompt cache，因为这种一次性请求几乎不会被复用。`CompactionResult` 含 `summary`、`firstKeptEntryId`、`tokensBefore`、可选 `usage` 和 `details`。
-
-`SessionManager` 负责补 `id` / `parentId` 并追加 `CompactionEntry`。之后 session 重载上下文：模型先看到检查点 system 消息和摘要，再看到 `firstKeptEntryId` 起的原文。`tokensBefore` 在写入前按重建后的投影重算。
-
-`retain-none` 的压缩把 `firstKeptEntryId` 设成 compaction 自己的 id，表示前面一条原文都不留。下一次压缩从这条之后开始。
-
-扩展可以听 `session_before_compact`（`core/extensions/types.ts`）。它若给出摘要，就写入 `fromHook: true` 的条目，默认 `compact()` 不再跑。失败走 `session_compact_failed`。`fromHook` 是历史字段名，现在表示「来自扩展」。
-
-### 溢出恢复的顺序
-
-溢出或 length 的恢复不改写已经发生的 `turn_end` / `agent_end`。完成后的尝试先被看见，再修模型上下文，然后开一轮新的 run：
+**磁盘**
 
 ```text
-持久化最终 assistant
-→ turn_end / agent_end
-→ 为这次尝试追加 context_edit 省略
-→ 成功时跑 session_before_compact 并追加 compaction
-→ 作为新 run 重试
+$MY_AGENT_DIR/sessions/--<encoded-cwd>--/<timestamp>_<sessionId>.jsonl
 ```
 
-带 tool call 的 length 响应保留合成的失败 tool result，走普通的工具 / 队列调度，不强制结束 run。恢复压缩失败或被取消时，省略编辑保留，不追加 compaction，也不做内部重试。
+`MY_AGENT_DIR` 默认 `~/.my-agent`。`<timestamp>` 是 header 里的 ISO 时间，把 `:` 和 `.` 换成 `-`。文件在第一条 user 或 assistant 消息追加时用 `open(..., "wx")` 创建，先写入已经在内存中的 header 和更早的 system 消息，再写这一条。之后只用 `appendFile`。
 
-### 分支摘要
-
-`/tree` 从旧叶子切到另一条路径时，`branch-summarization.ts` 找新旧路径的最深公共祖先，收集被离开的那一侧，在 token 预算内从新到旧选取消息，生成 `BranchSummaryEntry`。`parentId` 是新分支的起点，`fromId` 是旧叶子。文件读写集合同样累加进 `details`。这不是自动压缩，不要在 M2 里和阈值压缩绑在一起。
-
-### 中断
-
-`AgentSession.abort()`：
-
-1. 若 run 还活着，置 `_agentRunAbortRequested`。
-2. 取消重试、压缩和分支摘要。
-3. 调用 `agent.abort()`，使 `StreamFn` 和工具的 `AbortSignal` 触发。
-4. `await waitForIdle()`。
-
-进程内 abort 时，工具 `execute` 抛错会被 `executePreparedToolCall` 收成 `isError` 的 tool result，随后 `message_end` 落盘。assistant 若停在 `stopReason: "aborted"`，这条消息也会在 `message_end` 写入。`clearQueue()` 把尚未注入的 steering 和 follow-up 交还调用方（交互模式放回编辑器），不写进会话。
-
-恢复会话是 `SessionManager` 打开已有文件，`_loadEntries` 后叶子停在文件顺序的当前头。`AgentSessionRuntime` 在 `/resume` 前先 `abort()` 当前 run，再切换文件，并发 `session_start`，`reason` 为 `"resume"`。
+## 接入 agent 循环
 
 ```mermaid
 sequenceDiagram
-  participant U as 用户
   participant S as AgentSession
   participant A as Agent
   participant F as JSONL
-  U->>S: abort
-  S->>A: abort signal
-  A-->>S: message_end aborted 或错误 tool result
-  S->>F: append 已完成的行
-  S-->>U: clearQueue 交还未发送文本
-  Note over S,F: 进程若被 SIGKILL，只有已 append 的完整行还在
-  U->>S: 再次打开同一文件
-  S->>F: loadEntriesFromFile
-  S->>S: buildSessionContext 从叶子投影
+  S->>A: prompt
+  A-->>S: message_end
+  S->>F: appendMessage
+  A-->>S: turn_end
+  S->>S: shouldCompact
+  S->>F: appendCompaction
+  S->>A: 下一轮前替换 state.messages 为投影
 ```
 
-### 和 pi-durable 的差别
+`AgentSession` 在构造时 `agent.subscribe`。监听器对 `message_end` 调用 `appendMessage`，然后才 resolve，这样上游「监听器是屏障」的语义保留。压缩发生在 `Agent` 的 `prepareRequest` 钩子里：若 `shouldCompact` 为真，先 `compact` 并 `appendCompaction`，再把 `buildSessionContext().messages` 设回 `agent.state.messages`。不要在工具 `execute` 里压缩。
 
-`packages/durable/README.md` 的不变量是：对话、模型 turn、工具调用和自有状态在展示之前提交；进程死在 turn 中途，重开 storage 会从停下的地方继续。工具效果不放在存储事务里执行。状态复制用 Chord 的 `replicatedState`。
+## 核心数据结构
 
-coding-agent 做不到这一点。它在 `message_end` 追加一行，工具效果发生在追加 tool result 之前。手搓 M2 应明确选择 JSONL 语义，并在恢复时修补悬空 tool call，而不是半套实现 durable。
+### 文件行
 
-悬空 tool call 的修补是手搓必须加的，上游加载器不会自动补：若叶子路径上 assistant 含 tool call，且后面没有对应 `toolResult`，恢复时追加一条 `isError: true` 的结果，说明进程在工具执行期间退出。不要重新执行 `replay !== "safe"` 的工具。
+第一行永远是 header，没有 `id` 和 `parentId`。其余每一行都是 `SessionEntry`。
+
+```ts
+export const CURRENT_SESSION_VERSION = 3;
+
+export interface SessionHeader {
+  type: "session";
+  version: 3;
+  id: string;
+  timestamp: string;       // ISO 8601
+  cwd: string;
+  parentSession?: string;  // M2 不写这个字段
+}
+
+export interface SessionEntryBase {
+  id: string;              // 8 hex，或冲突后退回的 UUID
+  parentId: string | null;
+  timestamp: string;       // ISO 8601
+}
+
+export interface SessionMessageEntry extends SessionEntryBase {
+  type: "message";
+  message: AgentMessage;   // timestamp 仍是毫秒数字
+}
+
+export interface ModelChangeEntry extends SessionEntryBase {
+  type: "model_change";
+  provider: string;
+  modelId: string;
+}
+
+export interface ThinkingLevelChangeEntry extends SessionEntryBase {
+  type: "thinking_level_change";
+  thinkingLevel: ThinkingLevel;
+}
+
+export interface CompactionEntry extends SessionEntryBase {
+  type: "compaction";
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  details?: { readFiles: string[]; modifiedFiles: string[] };
+  usage?: Usage;
+  fromHook?: boolean;
+  systemMessage?: SystemMessage;
+}
+
+export interface ContextEditEntry extends SessionEntryBase {
+  type: "context_edit";
+  targetId: string;
+  replacement: { content: string } | null;
+}
+
+export interface BranchSummaryEntry extends SessionEntryBase {
+  type: "branch_summary";
+  fromId: string;
+  summary: string;
+}
+
+export interface CustomEntry extends SessionEntryBase {
+  type: "custom";
+  customType: string;
+  data?: unknown;
+}
+
+export interface CustomMessageEntry extends SessionEntryBase {
+  type: "custom_message";
+  customType: string;
+  content: string;
+  display: boolean;
+}
+
+export type SessionEntry =
+  | SessionMessageEntry
+  | ModelChangeEntry
+  | ThinkingLevelChangeEntry
+  | CompactionEntry
+  | ContextEditEntry
+  | BranchSummaryEntry
+  | CustomEntry
+  | CustomMessageEntry;
+
+export type FileEntry = SessionHeader | SessionEntry;
+```
+
+对应上游同名接口。M2 的写入方法只实现 `message`、`compaction`、`context_edit`、`model_change`、`thinking_level_change`。另外三种解析后放进树，但没有 append API。`label`、`usage`、`session_info` 不进联合类型。读到未知 `type` 时跳过该行并记一条 warning，不要抛错，这样以后加条目不会让旧程序拒绝文件。
+
+不变量：
+
+- `parentId` 要么是 `null`（根），要么指向本文件里更早出现的 `id`。追加时父指针就是当前 `leafId`。
+- `compaction.firstKeptEntryId` 必须是本文件已有的 `id`，或者等于这条 compaction 自己的 `id`（表示前面都不保留）。
+- 禁止通过 `appendMessage` 写入一种自制的 `role: "compactionSummary"`。上游 `appendMessage` 明确拒绝把摘要塞进 message。
+
+### 压缩设置和准备结果
+
+```ts
+export interface CompactionSettings {
+  enabled: boolean;
+  reserveTokens: number;     // 默认 16384
+  keepRecentTokens: number;  // 默认 20000
+}
+
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+  enabled: true,
+  reserveTokens: 16384,
+  keepRecentTokens: 20000,
+};
+
+export interface CompactionPreparation {
+  firstKeptEntryId: string;
+  messagesToSummarize: AgentMessage[];
+  turnPrefixMessages: AgentMessage[];
+  isSplitTurn: boolean;
+  tokensBefore: number;
+}
+
+export interface CompactionResult {
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+}
+
+export type SummarizeFn = (messages: AgentMessage[], signal?: AbortSignal) => Promise<string>;
+```
+
+`shouldCompact`：
+
+```ts
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+  if (!settings.enabled) return false;
+  return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+
+`contextTokens` 的算法：从投影末尾找最后一条 `stopReason` 不是 `error`/`aborted` 且 `usage.totalTokens > 0` 的 assistant。用它的 `totalTokens`，再加上它之后每条消息的 `estimateTokens`。找不到这样的 assistant 时，全部用 `estimateTokens` 相加。
+
+### 投影
+
+```ts
+export interface SessionContext {
+  messages: AgentMessage[];
+  thinkingLevel: ThinkingLevel;
+  model: { provider: string; modelId: string } | null;
+}
+
+export function buildSessionContext(entries: SessionEntry[], leafId: string | null): SessionContext
+```
+
+算法：
+
+1. 从 `leafId` 沿 `parentId` 走到根，再反转成从旧到新。`leafId === null` 时消息为空。
+2. 路径上若有 `compaction`，只用最后一条。结果序列等于：这条 compaction 产生的消息，加上 `firstKeptEntryId` 到 compaction 之前的非 system 条目，再加上 compaction 之后的条目。
+3. compaction 产生的消息是：可选的 `systemMessage`，然后一条 `UserMessage`，`content` 为摘要文本。不要发明新的 role。上游用 `compactionSummary` 自定义消息；手搓默认把它变成 user 文本，并在正文前加固定前缀 `[compaction]\n`，这样 `convertToLlm` 不用认识新 role。这是写明的偏差。
+4. 对路径上的 `context_edit`，同一 `targetId` 以靠近叶子的那条为准。`replacement: null` 则目标不产生消息。非空则只替换 `content`，role 不变。
+5. `model_change` 和 `thinking_level_change` 不产生消息。投影的 `model` 和 `thinkingLevel` 取路径上最后一条。
+6. `custom` 不产生消息。`custom_message` 产生 user 消息，`content` 用条目的 `content`。
+7. `branch_summary` 产生 user 消息，前缀 `[branch]\n`。
+
+### 会话运行状态
+
+```ts
+type SessionPhase =
+  | { phase: "idle" }
+  | { phase: "running" }
+  | { phase: "compacting" }
+  | { phase: "aborting" };
+```
+
+`prompt` 只允许从 `idle` 进入 `running`。压缩期间是 `compacting`，此时 `abort()` 把传给 `SummarizeFn` 的 `AbortSignal` 触发，并回到 `idle`，不写 compaction 行。不要在 `compacting` 时接受新的 `prompt`。
+
+### AgentSession 事件
+
+在 `AgentEvent` 之外再加三种，订阅者仍然看 `type`：
+
+```ts
+export type AgentSessionEvent =
+  | AgentEvent
+  | { type: "compaction_start"; reason: "manual" | "threshold" }
+  | { type: "compaction_end"; reason: "manual" | "threshold"; ok: boolean }
+  | { type: "queue_update"; steering: string[]; followUp: string[] };
+```
+
+上游还有 `overflow` reason 和 `willRetry`。M2 的自动压缩只用 `threshold` 和 `manual`。溢出恢复若做了，复用 `threshold`，不要加第三个字符串，除非测试需要区分。默认：溢出恢复的事件 reason 用 `"threshold"`。
+
+## 方案
+
+### SessionManager
+
+```ts
+export class SessionManager {
+  static create(cwd: string, options?: { agentDir?: string; sessionFile?: string; persist?: boolean; id?: string }): SessionManager;
+  getSessionFile(): string | undefined;
+  getLeafId(): string | null;
+  getBranch(): SessionEntry[];
+  getEntries(): FileEntry[];
+  appendMessage(message: AgentMessage): string;
+  appendCompaction(summary: string, firstKeptEntryId: string, tokensBefore: number, details?: CompactionEntry["details"], usage?: Usage): string;
+  appendContextEdit(targetId: string, replacement: { content: string } | null): string;
+  appendModelChange(provider: string, modelId: string): string;
+  appendThinkingLevelChange(level: ThinkingLevel): string;
+  buildSessionContext(): SessionContext;
+}
+```
+
+`append*` 生成 `id`，`parentId = leafId`，然后 `leafId = id`，再 `_persist`。`persist: false` 时只改内存，测试用这个模式可以不碰磁盘。`resume.test.ts` 必须用 `persist: true`。
+
+`loadEntriesFromFile`：按行解析，空行跳过，`JSON.parse` 失败的行跳过。header 缺失或 `version !== 3` 则抛错。
+
+### 切点
+
+`prepareCompaction(branch, settings)` 只看 `buildSessionContext` 之前的原始 branch（叶子到根的条目），但 token 用投影后的消息估算。规则：
+
+1. 路径最后一条已经是 `compaction` 时返回 `undefined`。
+2. 从尾部向前累加 `estimateTokens`，直到和 ≥ `keepRecentTokens`。切点是仍要保留的第一条。
+3. 合法切点的条目类型：`message` 且 role 是 `user`、`assistant` 或 `system` 不算切点；system 永远留在检查点里，不单独当切点。切在 user 或 assistant 的 message 上。不要切在 toolResult 上。若计算出的下标落在 toolResult，向更早的方向移到它所属的 assistant。
+4. 若从切点到尾部没有一条 user，说明一个 user 回合超了预算。这是 split turn：`turnPrefixMessages` 是该 user 到切点之前的消息，`messagesToSummarize` 是更早的消息。两次调用 `SummarizeFn`，用 `\n---\n` 拼成一条摘要。
+5. 没有任何可摘要消息时返回 `undefined`。
+
+`compact()` 调用 `SummarizeFn`，signal abort 时抛出或返回拒绝。`AgentSession` 捕获后发 `compaction_end` 且 `ok: false`，不调用 `appendCompaction`。
+
+`appendCompaction` 时 `systemMessage` 取当前投影里的首条 system 消息的深拷贝。`firstKeptEntryId` 由 `prepareCompaction` 给出，不要在 append 时重新计算。
+
+### 悬空 tool call
+
+`AgentSession` 在 `SessionManager.create` 打开已有文件之后立刻跑一次 `repairDanglingToolCalls()`：
+
+```ts
+function repairDanglingToolCalls(session: SessionManager): void {
+  const messages = session.buildSessionContext().messages;
+  const answered = new Set(messages.filter((m) => m.role === "toolResult").map((m) => m.toolCallId));
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const block of message.content) {
+      if (block.type !== "toolCall" || answered.has(block.id)) continue;
+      session.appendMessage({
+        role: "toolResult",
+        toolCallId: block.id,
+        toolName: block.name,
+        content: [{ type: "text", text: "Tool result missing because the process exited before it was recorded." }],
+        isError: true,
+        timestamp: Date.now(),
+      });
+    }
+  }
+}
+```
+
+不读取 `AgentTool.replay`。M2 一律补错误结果，不重放工具。`replay: "safe"` 留给以后，现在即使工具标了 `safe` 也不重跑。
+
+### abort
+
+```ts
+async abort(): Promise<void> {
+  this.phase = "aborting";
+  this.compactAbort?.abort();
+  this.agent.abort();
+  await this.agent.waitForIdle();
+  this.phase = "idle";
+}
+clearQueue(): { steering: string[]; followUp: string[] }
+```
+
+`clearQueue` 把 `Agent` 队列里还没变成 `message_end` 的用户文本取出来并清空。这些字符串不调用 `appendMessage`。交互层以后把它们放回编辑器。
 
 ## 备选方案
 
 | 方案 | 放弃原因 |
 |---|---|
-| 只保留滑动窗口、直接丢弃旧消息 | 模型会忘掉已做的文件修改。上游用摘要，并把读写路径放进 `details`。 |
-| 压缩时改写或截断 JSONL | 破坏树、导出和「回到压缩前叶子仍能看见原文」的 `context_edit` 语义。 |
-| 每次消息都重写整个文件 | `appendFileSync` 把崩溃窗口限制在最后一行。全量重写在崩溃时更容易损坏整份历史。 |
-| M2 改用 durable Session | 恢复更强，但要同时引入任务状态机和 Chord。与「先跑通 JSONL」的依赖顺序不符。 |
+| 压缩时截断文件 | 叶子切回旧节点时原文要还在。`context_edit` 也依赖这一点 |
+| 每次重写整个文件 | 崩溃会损坏全部历史。追加把损坏限制在最后一行 |
+| 自定义 `role: "compactionSummary"` | `convertToLlm` 和假模型都要认识它。M2 用带前缀的 user 消息，投影测试锁住前缀 |
 
 ## 横切关注点
 
-- **错误**：摘要调用失败不删除已有历史。溢出恢复失败时保留 `context_edit` 省略，避免把失败的超长尝试再次送给模型。
-- **并发**：压缩发生在 `prepareNextTurn`，此时上一轮工具已经结束。不要在工具 `execute` 里触发压缩。`abortCompaction` 必须让 `compact()` 的 `AbortSignal` 生效，避免 abort 后摘要仍写进树。
-- **持久化**：一行一个 JSON 对象。加载端跳过坏行。若要更强的崩溃保证，手搓可以在追加后 `fsync`，上游没有这样做。
-- **用量**：摘要的 `usage` 计入会话总计，但摘要消息本身是模型上下文的一部分，不要把它再算进「未压缩的原文 token」。
+- **错误**：摘要失败保留原树。`compaction_end.ok === false`。
+- **并发**：`phase !== "idle"` 时 `prompt` 抛 `Error("session is busy")`。
+- **持久化**：`wx` 创建，之后 append。两个进程写同一文件不在 M2 解决。CLI 不支持同时开两个会话写同一路径。
+- **用量**：`tokensBefore` 是压缩前的估算值，写入后不要再改。
 
 ## 手搓实现笔记
 
-1. 先写 header、`message` 追加、从叶子回放到 `messages[]`。用一个内存数组模拟也行，但验收要落到真实文件并杀掉进程再读。
-2. 接上 `Agent.subscribe`：只在 `message_end` 追加。`message_update` 不写盘。
-3. 实现 abort：signal 进假模型和工具；idle 之后文件含 aborted assistant；队列文本不在文件里。
-4. 写恢复修补：悬空 tool call → 错误 tool result。
-5. 再写 `shouldCompact`、`prepareCompaction`、假摘要和 `CompactionEntry` 投影。用固定 token 估算，先不要接真实 tokenizer。
-6. 分支摘要和扩展钩子放到这条路径稳定之后。
-
-验收用例至少包括：压缩后原文仍在文件中、模型请求不含切点之前的 user 文本、坏的最后一行被忽略、abort 与 SIGKILL 两种中断的可见行为不同。
+按总览 M2 的 7 步。投影测试先于 `prepareCompaction`。修悬空 tool call 的测试用一个手写的 JSONL 字符串，不要靠杀掉进程。`agent-session.ts` 的订阅器是写盘的唯一位置，`SessionManager` 不要 import `Agent`。
