@@ -106,14 +106,14 @@ if [[ ${#notes[@]} -eq 0 ]]; then
     docs/go.md
     docs/os.md
     docs/network.md
-    docs/pi-agent/index.md
-    docs/pi-agent/core.md
-    docs/pi-agent/compaction-resume.md
-    docs/pi-agent/memory-skill.md
-    docs/pi-agent/git.md
-    docs/pi-agent/mcp.md
-    docs/pi-agent/gateway.md
-    docs/pi-agent/tui.md
+    docs/terminal-agent/index.md
+    docs/terminal-agent/core.md
+    docs/terminal-agent/compaction-resume.md
+    docs/terminal-agent/memory-skill.md
+    docs/terminal-agent/git.md
+    docs/terminal-agent/mcp.md
+    docs/terminal-agent/gateway.md
+    docs/terminal-agent/tui.md
   )
 fi
 
@@ -125,6 +125,10 @@ for src in "${notes[@]}"; do
   base="$(pdf_basename "$src")"
   html="build/${base}.html"
   pdf="docs/pdf/${base}.pdf"
+  extra_style=()
+  if [[ "$src" == docs/terminal-agent/* ]]; then
+    extra_style=(-H build/terminal-agent-style.html)
+  fi
   echo "pandoc $src -> $html"
   pandoc "$src" \
     -f markdown \
@@ -133,6 +137,7 @@ for src in "${notes[@]}"; do
     --toc \
     --toc-depth=3 \
     -H build/style.html \
+    "${extra_style[@]}" \
     --metadata lang=zh \
     -o "$html"
   echo "chrome $html -> $pdf"

@@ -17,21 +17,21 @@ PDFS = {
     "go.md": "go.pdf",
     "os.md": "os.pdf",
     "network.md": "network.pdf",
-    "pi-agent/index.md": "pi-agent-index.pdf",
-    "pi-agent/core.md": "pi-agent-core.pdf",
-    "pi-agent/compaction-resume.md": "pi-agent-compaction-resume.pdf",
-    "pi-agent/memory-skill.md": "pi-agent-memory-skill.pdf",
-    "pi-agent/git.md": "pi-agent-git.pdf",
-    "pi-agent/mcp.md": "pi-agent-mcp.pdf",
-    "pi-agent/gateway.md": "pi-agent-gateway.pdf",
-    "pi-agent/tui.md": "pi-agent-tui.pdf",
+    "terminal-agent/index.md": "terminal-agent-index.pdf",
+    "terminal-agent/core.md": "terminal-agent-core.pdf",
+    "terminal-agent/compaction-resume.md": "terminal-agent-compaction-resume.pdf",
+    "terminal-agent/memory-skill.md": "terminal-agent-memory-skill.pdf",
+    "terminal-agent/git.md": "terminal-agent-git.pdf",
+    "terminal-agent/mcp.md": "terminal-agent-mcp.pdf",
+    "terminal-agent/gateway.md": "terminal-agent-gateway.pdf",
+    "terminal-agent/tui.md": "terminal-agent-tui.pdf",
 }
 
 
 def _pdf_href_prefix(src_uri: str, use_directory_urls: bool) -> str:
     """从页面 URL 回到站点根下的 pdf/。
 
-    directory URLs 把 docs/pi-agent/core.md 放在 /pi-agent/core/，需要 ../../pdf/。
+    directory URLs 把 docs/terminal-agent/core.md 放在 /terminal-agent/core/，需要 ../../pdf/。
     顶层 docs/redis.md 放在 /redis/，仍然是 ../pdf/。
     """
     parent = PurePosixPath(src_uri).parent
