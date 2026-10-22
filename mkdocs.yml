@@ -1,5 +1,5 @@
 site_name: 面试八股笔记
-site_description: Redis、MySQL、Go 秒杀、AI Agent、Java、Go、操作系统、计算机网络
+site_description: Redis、MySQL、Go 秒杀、AI Agent、手搓 Pi Agent、Java、Go、操作系统、计算机网络
 site_url: https://losaveroad.github.io/interview-prep/
 repo_url: https://github.com/LosAveRoad/interview-prep
 repo_name: LosAveRoad/interview-prep
@@ -78,6 +78,15 @@ nav:
   - MySQL: mysql.md
   - Go 秒杀: seckill.md
   - AI Agent: agent.md
+  - 手搓 Pi Agent:
+      - 总览与里程碑: pi-agent/index.md
+      - Agent Core: pi-agent/core.md
+      - 上下文压缩与中断恢复: pi-agent/compaction-resume.md
+      - 记忆与 Skill: pi-agent/memory-skill.md
+      - Git 与仓库工具: pi-agent/git.md
+      - MCP: pi-agent/mcp.md
+      - 网关与适配层: pi-agent/gateway.md
+      - TUI: pi-agent/tui.md
   - Java: java.md
   - Go: go.md
   - 操作系统: os.md

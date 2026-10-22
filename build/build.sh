@@ -81,6 +81,20 @@ print_pdf() {
   rm -rf "$tmp"
 }
 
+# 顶层笔记沿用文件名；子目录笔记加上目录前缀，避免 index.md 等重名。
+pdf_basename() {
+  local src="$1"
+  local rel="${src#docs/}"
+  local base dir
+  base="$(basename "${rel%.md}")"
+  dir="$(dirname "$rel")"
+  if [[ "$dir" == "." ]]; then
+    printf '%s' "$base"
+  else
+    printf '%s-%s' "${dir//\//-}" "$base"
+  fi
+}
+
 notes=("$@")
 if [[ ${#notes[@]} -eq 0 ]]; then
   notes=(
@@ -92,6 +106,14 @@ if [[ ${#notes[@]} -eq 0 ]]; then
     docs/go.md
     docs/os.md
     docs/network.md
+    docs/pi-agent/index.md
+    docs/pi-agent/core.md
+    docs/pi-agent/compaction-resume.md
+    docs/pi-agent/memory-skill.md
+    docs/pi-agent/git.md
+    docs/pi-agent/mcp.md
+    docs/pi-agent/gateway.md
+    docs/pi-agent/tui.md
   )
 fi
 
@@ -100,7 +122,7 @@ for src in "${notes[@]}"; do
     echo "找不到笔记: $src" >&2
     exit 1
   fi
-  base="$(basename "${src%.md}")"
+  base="$(pdf_basename "$src")"
   html="build/${base}.html"
   pdf="docs/pdf/${base}.pdf"
   echo "pandoc $src -> $html"

@@ -36,6 +36,14 @@
 
     [阅读笔记](agent.md) · [下载 PDF](pdf/agent.pdf)
 
+-   **手搓 Pi Agent**
+
+    ---
+
+    从 earendil-works/pi 反推的实现设计：agent 循环、压缩与恢复、skill、git、MCP、网关和 TUI，以及手写里程碑。
+
+    [阅读设计](pi-agent/index.md) · [下载 PDF](pdf/pi-agent-index.pdf)
+
 -   **Java**
 
     ---
@@ -81,6 +89,7 @@ flowchart LR
   home --> mysql[MySQL]
   home --> seckill[Go 秒杀]
   home --> agent[AI Agent]
+  home --> pi[手搓 Pi Agent]
   home --> java[Java]
   home --> golang[Go]
   home --> os[操作系统]

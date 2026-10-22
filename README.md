@@ -12,6 +12,14 @@
 | MySQL | [`docs/mysql.md`](docs/mysql.md) | [`docs/pdf/mysql.pdf`](docs/pdf/mysql.pdf) |
 | Go 秒杀 | [`docs/seckill.md`](docs/seckill.md) | [`docs/pdf/seckill.pdf`](docs/pdf/seckill.pdf) |
 | AI Agent | [`docs/agent.md`](docs/agent.md) | [`docs/pdf/agent.pdf`](docs/pdf/agent.pdf) |
+| 手搓 Pi Agent 总览 | [`docs/pi-agent/index.md`](docs/pi-agent/index.md) | [`docs/pdf/pi-agent-index.pdf`](docs/pdf/pi-agent-index.pdf) |
+| Agent Core | [`docs/pi-agent/core.md`](docs/pi-agent/core.md) | [`docs/pdf/pi-agent-core.pdf`](docs/pdf/pi-agent-core.pdf) |
+| 上下文压缩与中断恢复 | [`docs/pi-agent/compaction-resume.md`](docs/pi-agent/compaction-resume.md) | [`docs/pdf/pi-agent-compaction-resume.pdf`](docs/pdf/pi-agent-compaction-resume.pdf) |
+| 记忆与 Skill | [`docs/pi-agent/memory-skill.md`](docs/pi-agent/memory-skill.md) | [`docs/pdf/pi-agent-memory-skill.pdf`](docs/pdf/pi-agent-memory-skill.pdf) |
+| Git 与仓库工具 | [`docs/pi-agent/git.md`](docs/pi-agent/git.md) | [`docs/pdf/pi-agent-git.pdf`](docs/pdf/pi-agent-git.pdf) |
+| MCP | [`docs/pi-agent/mcp.md`](docs/pi-agent/mcp.md) | [`docs/pdf/pi-agent-mcp.pdf`](docs/pdf/pi-agent-mcp.pdf) |
+| 网关与适配层 | [`docs/pi-agent/gateway.md`](docs/pi-agent/gateway.md) | [`docs/pdf/pi-agent-gateway.pdf`](docs/pdf/pi-agent-gateway.pdf) |
+| TUI | [`docs/pi-agent/tui.md`](docs/pi-agent/tui.md) | [`docs/pdf/pi-agent-tui.pdf`](docs/pdf/pi-agent-tui.pdf) |
 | Java | [`docs/java.md`](docs/java.md) | [`docs/pdf/java.pdf`](docs/pdf/java.pdf) |
 | Go | [`docs/go.md`](docs/go.md) | [`docs/pdf/go.pdf`](docs/pdf/go.pdf) |
 | 操作系统 | [`docs/os.md`](docs/os.md) | [`docs/pdf/os.pdf`](docs/pdf/os.pdf) |
