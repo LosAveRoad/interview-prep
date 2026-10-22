@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 build/*.html
 !build/style.html
+!build/terminal-agent-style.html
 build/*.chrome.log
 .venv/

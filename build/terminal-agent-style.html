@@ -1,0 +1,10 @@
+<style>
+/* 项目规格含较长类型与测试表，打印时允许跨页与软换行。 */
+pre, pre code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; }
+table { table-layout: fixed; page-break-inside: auto; }
+thead { display: table-header-group; }
+tr { break-inside: avoid; }
+th, td { overflow-wrap: anywhere; }
+h2, h3, h4 { break-after: avoid; }
+@page { @bottom-center { content: counter(page); font-size: 9pt; color: #777; } }
+</style>
