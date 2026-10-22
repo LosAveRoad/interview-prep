@@ -1,186 +1,198 @@
 ---
 title: 网关与适配层
-subtitle: 扩展宿主、RPC 与 Chord
+subtitle: 扩展宿主和 JSONL RPC
 ---
 
 # 网关与适配层
 
 ## 背景
 
-这里的「网关」不是一台反向代理。Pi 把**同一份 `AgentSession`** 接到不同的入口，并把进程内插件和跨进程对象分成两个宿主：
+上游的通道共用一个会话：交互、print、JSON、RPC 都进 `AgentSession`。进程内插件是 `packages/coding-agent/src/core/extensions/` 的 `ExtensionFactory` 和 `ExtensionRunner`。RPC 是 `modes/rpc/rpc-mode.ts` 的按行 JSON。`packages/chord` 是另一套跨进程宿主，coding-agent 的 `package.json` 不依赖它。本仓库同样不引入 Chord。
 
-| 层 | 位置 | 做什么 |
-|---|---|---|
-| 通道适配 | `packages/coding-agent/src/modes/` | 交互 TUI、print、JSON 事件、RPC。都调用 `AgentSessionRuntime` |
-| 进程内插件宿主 | `core/extensions/loader.ts`、`runner.ts`、`types.ts` | 用 jiti 加载 TypeScript 扩展，`ExtensionAPI` 注册工具、命令、事件和 UI |
-| 跨进程宿主 | `packages/chord` | typed contract、对象引用、热重载、JSON 状态复制。**coding-agent 的 package.json 不依赖 chord** |
-| 持久化 harness | `packages/durable` | 实验性。用 Chord 做文档状态，用 pi-ai 做模型。不是 CLI 的网关 |
-
-Slack 一类聊天入口不在本仓库。上游 README 指向单独的 `earendil-works/pi-chat`。手搓不要在 coding-agent 源码里找 channel adapter 的 Slack 实现。
-
-MCP 是一种工具适配，协议细节在 [MCP](mcp.md)。它以扩展的形式挂在本页的插件宿主上。
+`@my/gateway` 不实现第二份循环，也不写 JSONL。写盘仍在 `@my/session` 的 `AgentSession`。
 
 ## 目标与非目标
 
 **目标**
 
-- 增加一种入口时不复制 agent 循环和会话写盘。
-- 插件能注册工具和监听压缩、会话切换等事件，并在热路径上有明确的失败边界。
-- 说清楚 Chord 适合什么时候再引入，避免 M5 同时做两套插件系统。
+- 扩展能 `registerTool` 和订阅已经落盘的事件。
+- 另一个进程能用 stdin/stdout 驱动 `prompt`、`steer`、`abort`、`compact`。
 
 **非目标**
 
-- 不实现 Chord 的 SQLite、WebSocket 集群和热重载。文档只固定它和进程内扩展的边界。
-- 不实现 print 模式的全部 CLI 旗标、主题和包管理器。
-- 不把扩展加载进模型进程或 WASM。上游扩展就是 Pi 进程里的 TypeScript，权限与进程相同。
+- 不实现 Chord、WebSocket、热重载、扩展 UI 对话框。
+- 不实现 print 以外的全部 CLI 旗标。`--print` 属于 M1，`--rpc` 属于本模块。
+- 不把扩展放到子进程。扩展和工具一样跑在本进程里。
 
-## 方案
+## 本模块在仓库中的位置
 
-### 通道共用会话
-
-`how-pi-works.md` 的 Interfaces：交互模式把会话和 agent 事件画在终端里；print 跑完一条 prompt 写出最终回复；JSON 模式把事件写成 JSONL；RPC 从 stdin 读命令、向 stdout 写响应和事件；SDK 在进程内创建 `AgentSession`。
-
-```mermaid
-flowchart TB
-  subgraph adapters [通道]
-    interactive[interactive-mode]
-    printMode[print-mode]
-    jsonMode[JSON 事件]
-    rpc[runRpcMode]
-    sdk[进程内 SDK]
-  end
-  runtime[AgentSessionRuntime]
-  session[AgentSession]
-  agent[Agent]
-  interactive --> runtime
-  printMode --> runtime
-  jsonMode --> runtime
-  rpc --> runtime
-  sdk --> session
-  runtime --> session
-  session --> agent
+```text
+packages/gateway/
+  package.json
+  tsconfig.json
+  src/index.ts
+  src/extensions/types.ts       # 上游 core/extensions/types.ts 的子集
+  src/extensions/runner.ts      # class ExtensionRunner
+  src/extensions/loader.ts      # 动态 import 一个文件
+  src/rpc/types.ts              # 上游 modes/rpc/rpc-types.ts 的子集
+  src/rpc/jsonl.ts              # 一行一个 JSON
+  src/rpc/rpc-mode.ts           # runRpcMode
+  test/extension-runner.test.ts
+  test/rpc.test.ts
+apps/cli/src/main.ts            # 增加 --rpc 分支
+apps/cli/src/wire.ts            # 信任判断之后调用 loader
 ```
 
-`AgentSessionRuntime` 负责切换会话文件：`/new`、`/resume`、`/fork` 之前先 `abort()` 当前 run，再拆掉旧会话，然后发出 `session_start`。入口不直接操作 JSONL。
-
-手搓时先固定一个 `Session` 接口，让 RPC 和 TUI 都依赖它：`prompt`、`steer`、`followUp`、`abort`、`subscribe`、`compact`、`getState`。M5 用 RPC 测这组方法，M6 的 TUI 再实现第二个适配器。
-
-### 进程内扩展
-
-`ExtensionFactory` 的类型是 `(pi: ExtensionAPI) => void | Promise<void>`。加载器 `loader.ts` 用 jiti 载入 TypeScript。在打包后的 Node、Bun 或 SEA 二进制里改走静态虚拟模块，避免运行时再找一份 TypeScript 编译器。手搓若只用 JavaScript 插件，一个动态 `import` 就够，不必移植 jiti。
-
-`ExtensionRunner` 持有已加载扩展和 `EventBus`。事件分两类：一部分由通用 `emit` 顺序派发，一部分（工具、命令、MCP 服务器变化）在注册表更新时顺带发出，例如 `mcp_servers_change`。
-
-`ExtensionAPI` 上和手搓相关的能力：
-
-- `registerTool`：得到一个进入 `Agent.state.tools` 的工具，自动参与 `declareToolChanges`。
-- 订阅 `session_before_compact` / `session_compact_failed` / `agent_settled` 等。压缩钩子可以替换默认摘要。
-- `registerMcpServer`：把服务器交给 MCP 扩展，而不是自己开一个 JSON-RPC 客户端。
-- UI：`select`、`confirm`、`input`、`editor`、`notify`、`setStatus`、`setWidget`。交互模式用 TUI 组件实现；RPC 模式把它们变成请求，见下一节。
-
-扩展代码和内置工具跑在同一进程。项目扩展位于 `.pi/extensions/`，只有项目被信任之后才加载（`trust-manager.ts`、`how-pi-works.md` 的 Trust）。用户扩展在 agent 目录，不需要项目信任。`/reload` 会重建扩展、skill 和上下文文件；进行中的 run 应先结束，避免旧工具的 `execute` 还在跑、工具表已经被换掉。
-
-失败约定：扩展工厂抛错时，上游把该扩展记入诊断并继续启动其他扩展。事件监听器抛错不能吞掉 `message_end` 的落盘。手搓应让监听器的异常变成日志，会话写入放在监听器之外，和现在 `AgentSession`「先 emit 扩展，再写盘」的顺序相比，更稳的手搓顺序是：**先写盘，再通知扩展**。上游是先扩展后写盘，扩展可以在写盘前改写事件，这是能力也是风险。手搓第一版不要给扩展修改已生成 assistant 文本的能力。
-
-### RPC
-
-`runRpcMode`（`modes/rpc/rpc-mode.ts`）接管 stdout，按行读写 JSON。协议：
-
-- 命令：带 `type`，可选 `id` 用来对上响应。
-- 响应：`type: "response"`，含 `command`、`success`，成功时有 `data`，失败时有 `error`。
-- 事件：`AgentSessionEvent` 发生就写出，不攒批。
-- 扩展 UI：Pi 写出 `extension_ui_request`，客户端用 `extension_ui_response` 回答。未回答前对应的 `select` / `confirm` / `input` 挂起。
-
-帧就是一行一个 JSON。`serializeJsonLine` 负责转义，避免事件里的换行把流切断。stdout 有背压时 `waitForRawStdoutBackpressure` 让生产方暂停，防止管道塞满之后 agent 继续无限生成。
-
-`docs/rpc-commands.md` 列出的命令覆盖 prompt、steer、follow_up、abort、clear_queue、会话切换、fork、clone、模型、思考档位、压缩、bash。手搓 M5 只实现：
-
-| 命令 | 映射 |
+| 文件 | 职责 |
 |---|---|
-| `prompt` | `session.prompt` |
-| `steer` / `follow_up` | 对应队列 |
-| `abort` | `session.abort` 然后 `clearQueue` 的结果放进响应 |
-| `get_state` | 模型、是否在流式输出、队列长度、会话文件路径 |
-| `compact` | `session.compact` |
-| `extension_ui_response` | 完成挂起的 UI 请求 |
+| `extensions/types.ts` | `ExtensionFactory`、`ExtensionAPI`、扩展事件 |
+| `extensions/runner.ts` | 保存工具和监听器，按顺序调用 |
+| `extensions/loader.ts` | `import(fileUrl)` 取默认导出并当成工厂。不用 jiti，扩展文件必须是已编译的 `.js` 或 Node 能直接 import 的 `.ts` 不在范围内。默认要求 `.js` |
+| `rpc/types.ts` | 命令和响应的联合类型 |
+| `rpc/jsonl.ts` | `serializeJsonLine`、按行读取 |
+| `rpc/rpc-mode.ts` | 读 stdin、写 stdout、把命令映射到 `AgentSession` |
+
+**依赖**：可以 import `@my/agent-core`、`@my/session`、`@my/mcp`、`@my/resources`。禁止 import `@my/tui`。
+
+**磁盘**
+
+```text
+~/.my-agent/extensions/*.js
+<cwd>/.my-agent/extensions/*.js     # 仅 projectTrusted
+```
+
+扩展源码不写入会话。扩展若需要持久状态，M5 不提供 `custom` 条目 API。不要在扩展里自己 `appendFile` 会话文件。
+
+## 接入 agent 循环
 
 ```mermaid
 sequenceDiagram
-  participant C as RPC 客户端
   participant R as runRpcMode
   participant S as AgentSession
-  C->>R: {"id":"1","type":"prompt","text":"..."}
+  participant E as ExtensionRunner
   R->>S: prompt
-  R-->>C: {"type":"response","id":"1","success":true}
-  S-->>R: message_update / tool_execution_end / agent_end
-  R-->>C: 每条事件一行
-  S-->>R: 扩展请求 select
-  R-->>C: extension_ui_request
-  C->>R: extension_ui_response
+  S->>S: message_end 已写入 JSONL
+  S-->>E: subscribe 回调
+  S-->>R: 同一条事件写成 stdout 一行
 ```
 
-响应和事件都在 stdout。客户端必须先看 `type` 和 `id`，不能假设下一条就是响应。stdin 关闭时结束进程，并 `killTrackedDetachedChildren` 清理扩展或 bash 留下的子进程。
+`ExtensionRunner.attach(session)` 调用 `session.subscribe`。回调里先 `await runner.emit(event)`。因为 `AgentSession` 的写盘发生在它自己的内部监听器，而该监听器是构造时注册的，早于 gateway 的订阅，所以 gateway 看到事件时对应消息已经追加。测试用这个顺序做断言：emit 间谍被调用时，文件里已经能读到该 `message` 的 `id`。
 
-print 和 JSON 模式是 RPC 的退化：没有命令循环，进程启动时带上唯一一条 prompt，结束时退出。它们仍应走 `Session.prompt`，这样落盘和压缩只有一份实现。
+不要让 `ExtensionRunner` 自己订阅裸 `Agent`，否则会和写盘监听器抢顺序。
 
-### Chord：另一套宿主
+## 核心数据结构
 
-`packages/chord/README.md` 把应用拆成**对象**：状态加代码，住在一个地址上，有人引用才存在。调用方拿到的是引用，本地和跨进程一样，热重载之后引用仍有效。每个对象有 principal，所有者和客人看到的方法可以不同。
+### 扩展
 
-和进程内扩展的对应关系：
+```ts
+export interface ExtensionAPI {
+  registerTool(tool: AgentTool): void;
+  on(type: AgentSessionEvent["type"], handler: (event: AgentSessionEvent) => Promise<void> | void): void;
+}
 
-| 进程内扩展 | Chord |
-|---|---|
-| `ExtensionFactory(pi)` 闭包 | `host.serve(Contract, factory)` |
-| 直接函数调用 | `method` + TypeBox 参数，经 link 传 JSON |
-| 进程内对象 | `memoryLinkPair`、`ipcLink`、`webSocketLink` |
-| 扩展字段随便放 | `replicatedState`：快照加增量，失败的 `change` 不发布 |
-| `/reload` 换模块 | 热重载让在途调用跑完旧代码，状态保留，不兼容变更在安全点迁移 |
-| 无 | `createHost`、`defineFacet`、多 host 名字 |
+export type ExtensionFactory = (api: ExtensionAPI) => void | Promise<void>;
 
-`Context` 携带 `AbortSignal` 和 `TelemetrySpan`，没有隐式的当前 span。`pi-durable` 的每个异步 API 都接收这个 `Context`。取消一次 `wait` 不会取消已经提交的工作。
-
-Chord 适合的手搓时机：有第二个进程要持有会话或工具执行，例如网关进程和沙箱进程分开，并且状态要以快照加增量同步。在那之前，RPC JSONL 已经是一个可用的进程边界，客户端可以是任何语言。不要为了「以后可能多进程」在 M5 引入 contract 和副本。
-
-durable 用 Chord 满足「只有提交后的状态可见」。那条不变量和 JSONL 的 `message_end` 追加不是同一个设计，见 [压缩与中断恢复](compaction-resume.md)。
-
-### 信任与加载顺序
-
-`how-pi-works.md` 给出的顺序是：先决定项目信任，再加载项目设置和项目资源，然后加载上下文文件。工具始终使用进程权限。手搓的启动顺序应保持：
-
-```text
-解析 cwd 和会话文件
-→ 信任判断
-→ 用户扩展与用户 skill
-→ 若信任：项目扩展、项目 skill、项目 mcp.json
-→ 上下文文件
-→ 通道开始读输入
+export interface ExtensionDiagnostic {
+  path: string;
+  message: string;
+}
 ```
 
-上下文文件放在信任之后加载是文档描述的产品顺序；源码里 context file 的发现本身不检查信任。手搓可以采用更严的顺序：未信任时仍显示上下文文件路径，但把内容换成占位说明。若要和上游一致，则未信任也注入 `AGENTS.md` 正文，并在设计里写明这个风险。
+`registerTool` 把工具 push 到一个数组。`attach` 之后 CLI 执行一次 `agent.state.tools = [...existing, ...runner.tools]`。重复 `registerTool` 同一个 `name` 时后一个被忽略，并记 diagnostic。不要覆盖内置 `read` 或 `bash`。
+
+监听器按注册顺序 await。其中一个抛错时，记下 diagnostic，继续下一个。不要让异常冒泡到 `AgentSession` 的订阅器外面，否则会打断后续事件。
+
+工厂抛错时，该文件的工具和监听器全部丢弃，其他文件继续。`loadDirectory` 返回 `{ diagnostics }`。
+
+### RPC
+
+```ts
+export type RpcCommand =
+  | { id?: string; type: "prompt"; text: string }
+  | { id?: string; type: "steer"; text: string }
+  | { id?: string; type: "follow_up"; text: string }
+  | { id?: string; type: "abort" }
+  | { id?: string; type: "get_state" }
+  | { id?: string; type: "compact"; instructions?: string };
+
+export interface RpcResponse {
+  id?: string;
+  type: "response";
+  command: string;
+  success: boolean;
+  data?: unknown;
+  error?: string;
+}
+```
+
+stdout 上还有原样写出的 `AgentSessionEvent`。那些对象的 `type` 不是 `"response"`。客户端必须先看 `type`。
+
+`get_state` 的 `data`：
+
+```ts
+export interface RpcState {
+  isStreaming: boolean;
+  sessionFile?: string;
+  steering: number;
+  followUp: number;
+  model: string;
+}
+```
+
+一行的编码：`JSON.stringify(value) + "\n"`。解析时忽略空行。`JSON.parse` 失败则写一条 `success: false` 的响应，`command` 为 `"unknown"`，然后继续读下一行。不要退出进程。
+
+### 命令状态机
+
+RPC 循环自身没有与 `Agent` 平行的状态。它只看 `session` 是否正在 `prompt`：
+
+- `prompt`：若 session 忙，响应 `success: false`，`error: "busy"`。不改成 steer。
+- `steer` / `follow_up`：忙或不忙都接受。空字符串响应 `"empty"`。
+- `abort`：调用 `session.abort()`，`data` 为 `clearQueue()` 的返回值 `{ steering: string[], followUp: string[] }`。
+- `compact`：若忙，响应 `"busy"`。空闲时调用 `session.compact(instructions)`。
+- 未知 `type`：`success: false`，`error: "unknown command"`。
+
+stdin 关闭时 resolve `runRpcMode`。CLI 随后 `process.exit(0)`。退出前 `session.abort()` 一次，避免还在跑的 bash 被丢掉时不写 aborted 消息。能写多少算多少，不保证杀进程信号。
+
+## 方案
+
+### 加载顺序
+
+`apps/cli/src/wire.ts` 固定为：
+
+1. 解析 cwd 和 `MY_AGENT_DIR`。
+2. `projectTrusted = process.env.MY_AGENT_TRUST === "1" || existsSync(cwd + "/.my-agent")`。M5 仍不用交互询问。存在 `.my-agent` 即信任，是手搓默认，方便本地跑。上游会弹确认。偏差写在这里。
+3. 加载 `~/.my-agent/extensions/*.js`，字母序。
+4. 若信任，再加载 `<cwd>/.my-agent/extensions/*.js`。
+5. 读 `mcp.json`，连接 direct 服务器，最多等 10 秒。
+6. `createDefaultTools` 与扩展工具、MCP 工具合成 `agent.state.tools`。
+7. 按 argv 进入 `--print`、`--rpc` 或以后的 TUI。
+
+### runRpcMode
+
+```ts
+export function runRpcMode(session: AgentSession, input: AsyncIterable<string>, write: (line: string) => void): Promise<void>
+```
+
+测试传入字符串数组的 async iterable，不打开真 stdin。`apps/cli` 用 `readline` 把 stdin 变成行再调用它。
+
+每条命令先写响应，再让 `prompt` 的事件继续往外流。`prompt` 的响应在调用 `session.prompt` 之前就写出 `success: true`，表示已接受，不表示模型已结束。结束看后面的 `agent_end` 事件。这和上游 RPC「先响应再流事件」一致。
 
 ## 备选方案
 
 | 方案 | 放弃原因 |
 |---|---|
-| 每种通道一个 Agent 子类 | 上游把差异留在适配器。复制循环会让压缩和落盘分叉。 |
-| 用 Chord 做进程内插件 | coding-agent 没有这么做。TypeBox contract 和 link 对同进程工具注册是额外的一层。 |
-| HTTP 网关作为第一种适配器 | RPC 已经是行分隔 JSON，测试时用管道即可，不需要端口、认证和 SSE。HTTP 可以以后包一层 RPC。 |
-| 扩展运行在子进程 | 更安全，但 `registerTool` 的 `execute` 就变成了 RPC。那是 Chord 或 MCP 的工作，不是 `ExtensionRunner` 的工作。 |
+| 每种通道一个 Agent 子类 | 落盘会分叉。通道只拿 `AgentSession` |
+| 用 Chord 做插件 | coding-agent 没有这么做。同进程工具不需要 contract |
+| HTTP 作为第一种远程接口 | 行分隔 JSON 用管道就能测。HTTP 以后可以包一层 RPC |
+| 忙时把 `prompt` 自动变成 `steer` | 调用方会分不清插话和排队。错误码 `"busy"` 是明确的 |
 
 ## 横切关注点
 
-- **错误**：RPC 命令失败返回 `success: false`，进程不退出。扩展监听器的异常不阻止 JSONL 追加。未知命令返回错误响应，不执行。
-- **并发**：stdin 上的 `prompt` 在 run 未结束时应变成 `steer` 或显式报错。上游交互模式要求调用方指定 steer 还是 follow-up。RPC 的 `prompt` 在忙碌时的行为要在实现里写死并测试，不能两种都像。
-- **持久化**：通道不写会话。它们只调用 session。扩展的 `custom` 条目才是插件自己的持久状态，且不进入模型上下文。
-- **背压**：RPC 写 stdout 要处理管道满。TUI 则用渲染合并，见 [TUI](tui.md)。两条路径的合并策略不同，不要共用一个队列实现。
-- **子进程**：退出时回收 bash 和 stdio MCP 拉起的进程。否则 RPC 客户端断开后 git 或语言服务器仍会留在后台。
+- **错误**：扩展和坏 JSON 都不退出进程。`compact` 失败时响应 `success: false`，`error` 为异常消息，会话文件保持原样。
+- **并发**：不并行处理 stdin 命令。一条命令的 `await session.prompt` 期间，后续行留在队列里，读完当前命令再取。`steer` 因此可以在 `prompt` 进行中被处理：实现时 `prompt` 不要独占读循环。默认：`prompt` 不 await 完再读 stdin。它 `void session.prompt(...)` 并立刻回到读循环，事件由订阅器写出。忙检测在调用前做。这样 `steer` 能在运行中进来。
+- **持久化**：gateway 不调用 `appendMessage`。
+- **子进程**：`runRpcMode` 结束时不负责杀 MCP 子进程。CLI 在 `finally` 里调用每个 `McpClient.close()`。stdio 传输的 `close` 必须 `kill` 子进程。
 
 ## 手搓实现笔记
 
-1. 定义 `Session` 接口并让 M2 的 `AgentSession` 实现它。测试只依赖接口。
-2. 写一个最小 `ExtensionRunner`：加载一个模块，调用工厂，收集 `registerTool` 和事件监听。监听器抛错时 session 文件仍有 `message_end`。
-3. 用管道做 RPC：父进程写 `prompt`，读到 `response` 和至少一条 `agent_end`。再测 `abort`。
-4. 加一个会 `select` 的扩展，断言客户端不回答时 run 停在 UI 请求上，回答后继续。
-5. 项目信任用一个枚举即可。未信任时项目扩展工厂不被调用。
-6. 把 Chord 记在后续设计里：触发条件是第二个进程需要共享可变状态，而不是「文档里出现了网关这个词」。
+按总览 M5 的后半段。先写 `rpc.test.ts` 的忙时拒绝，再写扩展监听器的抛错隔离。扩展夹具是一个临时 `.js` 文件，内容为 `export default function (api) { api.registerTool(...) }`。不要用 TypeScript 扩展夹具，loader 不编译。
