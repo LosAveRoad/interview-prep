@@ -1,146 +1,199 @@
 ---
 title: Git 与仓库工具
-subtitle: 文件工具、分支观察与 worktree
+subtitle: 文件工具和 git 元数据
 ---
 
 # Git 与仓库工具
 
 ## 背景
 
-coding-agent 没有名为 `git` 的内置工具。模型改仓库靠一组文件系统工具和 shell：`read`、`write`、`edit`、`grep`、`find`、`ls`、`bash`，Windows 上还有 `powershell`。实现在 `packages/coding-agent/src/core/tools/`。
+上游 coding-agent 没有名为 `git` 的工具。改仓库用 `packages/coding-agent/src/core/tools/` 里的 `read`、`write`、`edit`、`grep`、`find`、`ls`、`bash`。分支显示用 `core/footer-data-provider.ts` 的 `findGitPaths`，命令是 `git --no-optional-locks symbolic-ref --quiet --short HEAD`。`utils/git.ts` 的 `parseGitUrl` 和 `PackageManager.installGit` 只用于安装 Pi 包，不用于用户仓库。本仓库不实现 `installGit`。
 
-Git 在三条边上出现，职责不同：
-
-| 用途 | 代码 | 是否让模型执行 git |
-|---|---|---|
-| 页脚显示当前分支，扩展也能读到 | `core/footer-data-provider.ts` 的 `FooterDataProvider` | 否。只读 `HEAD` |
-| worktree 与主仓的 `AGENTS.md` 去重；`.agents/skills` 向上扫描停在仓库根 | `core/resource-loader.ts`、`core/package-manager.ts` 的 `findGitRepoRoot` | 否 |
-| 安装 Pi package（skill、扩展） | `PackageManager.installGit`：`git clone` 再按 ref `checkout` | 否。这是 CLI 装包，不是用户仓库里的提交 |
-
-模型如果要 `git status`、`git diff` 或 `git commit`，走 `bash` 工具，继承当前进程的权限和 cwd。上游 README 写明没有内置的文件系统、进程、网络或凭证沙箱。
-
-`packages/durable` 的示例把 reviewer 放在单独的 checkout，并注释「实践中用 `git worktree add`」。那是 durable 测试里的 cwd 隔离，不是 coding-agent 的工具。手搓不要把它写成已经存在的 git 子系统。
+`@my/tools` 把这些工具做成 `AgentTool`。git 元数据是只读观察器，放在 `git-paths.ts`，不进入模型的工具表。
 
 ## 目标与非目标
 
 **目标**
 
-- 模型能读、搜、改当前工作区，工具结果有大小上限。
-- UI 和 prompt 逻辑能识别普通仓库和 linked worktree，而不解析 git 对象数据库。
-- 并行工具不会把同一文件的两次写入交错。
+- `createDefaultTools(cwd)` 返回固定的 7 个工具，名字与上游一致。
+- worktree 和普通仓库都能解析出 `HEAD` 路径。
+- 对同一 cwd 的 write/edit 不会并行执行。
 
 **非目标**
 
-- 不实现 `git add` / `commit` / `rebase` 的专用工具、暂存区模型或冲突解决器。
-- 不为每个 agent 自动创建 worktree。隔离是部署问题（容器、独立 cwd），不是 M4 的默认行为。
-- 不把 `utils/git.ts` 的 `parseGitUrl` 用作用户仓库的远程操作。它只解析 `git:`、`https://`、`ssh://`、`git@host:path` 这类**包来源**。
+- 不提供 `git_status`、`git_commit`、`git_worktree`。模型要跑 git 就调用 `bash`。
+- 不自动 `git worktree add`。上游 durable 示例里的 worktree 是测试夹具的 cwd，不是工具。
+- 不解析 packfile、reftable 或 `HEAD` 文件内容来猜分支名。
 
-## 方案
+## 本模块在仓库中的位置
 
-### 工具面
+```text
+packages/tools/
+  package.json
+  tsconfig.json
+  src/index.ts                  # createDefaultTools
+  src/truncate.ts               # 上游 core/tools/truncate.ts
+  src/file-mutation-queue.ts    # 上游 core/tools/file-mutation-queue.ts
+  src/read.ts
+  src/write.ts
+  src/edit.ts
+  src/grep.ts
+  src/find.ts
+  src/ls.ts
+  src/bash.ts
+  src/git-paths.ts              # 上游 footer-data-provider.ts 的 findGitPaths
+  test/truncate.test.ts
+  test/mutation-queue.test.ts
+  test/git-paths.test.ts
+  test/edit.test.ts
+```
 
-`core/tools/index.ts` 导出的工厂：
+| 文件 | 职责 |
+|---|---|
+| `truncate.ts` | 把工具输出限制在 2000 行或 50 KiB |
+| `file-mutation-queue.ts` | 按 cwd 串行化写操作 |
+| `read.ts` / `write.ts` / `edit.ts` | 文件读写。edit 是精确字符串替换 |
+| `grep.ts` / `find.ts` / `ls.ts` | 搜索和列目录，用 Node API，不调用 `rg` 二进制 |
+| `bash.ts` | `child_process.spawn`，cwd 固定，`executionMode: "sequential"` |
+| `git-paths.ts` | 找 `.git`，问 git 当前分支名 |
+| `index.ts` | 组装工具数组。不在这里探测分支 |
 
-| 工具 | 工厂 | 作用 |
-|---|---|---|
-| `read` | `createReadTool` | 按路径读文件，可带行范围 |
-| `write` | `createWriteTool` | 整文件写入 |
-| `edit` | `createEditTool` | 按精确文本替换，失败时不部分写入 |
-| `grep` | `createGrepTool` | 内容搜索 |
-| `find` | `createFindTool` | 按文件名查找 |
-| `ls` | `createLsTool` | 列目录 |
-| `bash` | `createBashTool` | 在仓库里跑 shell，包括 git |
-| `powershell` | `createPowerShellTool` | Windows 上的对应物 |
+**依赖**：import `@my/agent-core` 的 `AgentTool` 和 `AgentToolResult`。禁止 import session、mcp、tui。
 
-每个工具都是 agent-core 的 `AgentTool`：`name`、`label`、`description`、TypeBox `parameters`、`execute`。`details` 留给 UI 渲染器（`core/tools/renderers/`），模型只看 `content`。
+**磁盘**：工具读写的是调用方传入的 cwd 下的项目文件，不是 `~/.my-agent`。`git-paths.ts` 只读 `.git` 和 `HEAD`。分支名不写入 JSONL。
 
-`system-prompt.ts` 的 `buildRules` 会看哪些工具被选中。如果只有 bash / powershell，没有 grep、find、ls，规则会要求模型用 shell 做列目录和搜索。工具都在时，优先用专用工具，shell 留给 git 和构建命令。这是 prompt 约定，循环本身不拦截 bash 里的 `ls`。
+## 接入 agent 循环
 
-输出进入模型之前经过 `truncate.ts`：`truncateHead`、`truncateTail`、`truncateLine`，以及 `DEFAULT_MAX_BYTES`、`DEFAULT_MAX_LINES`。大 `git diff` 或测试日志必须截断，否则一次工具结果就会打满 M2 的压缩阈值。截断标记要留在文本里，让模型知道内容不完整。
+`apps/cli/src/wire.ts` 在构造 `Agent` 之前：
 
-### 文件变更串行化
+```ts
+const tools = createDefaultTools(cwd);
+agent.state.tools = tools;
+```
 
-`toolExecution` 默认 parallel。两次 `edit` 若同时改一个文件，后写覆盖前写，或基于过期的原文做替换。`withFileMutationQueue`（`tools/file-mutation-queue.ts`）把变更同一工作区的 write/edit 排成队列。读和搜索不必互斥。
+之后工具表变化由 agent-core 的 `declareToolChanges` 宣布。工具 `execute` 抛错会被循环收成 `isError: true`。不要在工具里捕获之后再返回成功文本。
 
-bash 不经过这个队列。模型可以一边 `edit`、一边 `git status`。手搓第一版可以把 bash 标成 `executionMode: "sequential"`，让含 bash 的那一批全部串行，换取更少的交错。上游没有对 bash 做这个全局限制，它允许 bash 与其他工具并行，风险由模型自己承担。
+`resolveBranch` 不在循环里调用。M6 的页脚每 500ms 去抖后调用它。M4 的测试直接调用函数。
 
-### 分支观察
+## 核心数据结构
 
-`findGitPaths(cwd)` 从 cwd 向上找 `.git`：
+```ts
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024;
 
-- `.git` 是目录：`headPath = <git>/HEAD`，`commonGitDir` 就是这个目录，`repoDir` 是含 `.git` 的工作树。
-- `.git` 是文件且内容以 `gitdir: ` 开头：这是 linked worktree。`gitDir` 相对该文件所在目录解析，`HEAD` 在这个 gitDir 里。若存在 `commondir`，`commonGitDir` 再相对 gitDir 解析，指向主仓的 git 目录。
-- 找不到 `HEAD`，或 stat 失败：返回 `null`，调用方把仓库当成不存在。
+export interface TruncationResult {
+  content: string;
+  truncated: boolean;
+  originalLines: number;
+  originalBytes: number;
+}
 
-分支名不读 `HEAD` 文件的内容来猜。`resolveBranchWithGitSync` / `Async` 执行：
+export interface GitPaths {
+  repoDir: string;
+  commonGitDir: string;
+  headPath: string;
+}
+
+export interface ReadParams { path: string; offset?: number; limit?: number }
+export interface ReadDetails { path: string; truncated: boolean }
+
+export interface WriteParams { path: string; content: string }
+export interface WriteDetails { path: string; bytes: number }
+
+export interface EditParams { path: string; oldText: string; newText: string }
+export interface EditDetails { path: string; replacements: number }
+
+export interface BashParams { command: string }
+export interface BashDetails { exitCode: number | null; truncated: boolean }
+
+export interface GrepParams { pattern: string; path?: string }
+export interface FindParams { pattern: string; path?: string }
+export interface LsParams { path?: string }
+```
+
+`truncateHead` 从开头保留，超出时在末尾加一行 `\n[truncated]\n`。字节数按 UTF-8。先按行切，再按字节切。两个上限都生效，先触发的那个停。
+
+### GitPaths 的判定
+
+`findGitPaths(cwd)` 从 `path.resolve(cwd)` 向上：
+
+1. 没有 `.git`：去父目录。父目录等于自己时返回 `null`。
+2. `.git` 是目录，且 `<git>/HEAD` 存在：`repoDir` 是该目录的父目录的工作树，也就是含 `.git` 的那一层；`commonGitDir` 是 `.git` 目录；`headPath` 是 `HEAD`。
+3. `.git` 是文件，第一行匹配 `^gitdir: (.+)$`：把捕获组按 `.git` 文件所在目录做 `path.resolve`。该目录下必须有 `HEAD`。若还有 `commondir` 文件，`commonGitDir` 是相对这个 gitDir 解析后的路径，否则 `commonGitDir` 就是这个 gitDir。`repoDir` 是含 `.git` 文件的工作树根。
+4. stat 抛错或 `HEAD` 不存在：返回 `null`。不要向上继续，避免把更高层的另一个仓库当成当前仓库。这是手搓默认，写进测试：坏的 `.git` 文件使整个查找失败。
+
+```ts
+export function findGitPaths(cwd: string): GitPaths | null
+export function resolveBranch(repoDir: string, exec?: GitExec): Promise<string | null>
+
+export type GitExec = (repoDir: string) => Promise<{ status: number; stdout: string }>;
+```
+
+默认 `exec` 运行：
 
 ```text
 git --no-optional-locks symbolic-ref --quiet --short HEAD
 ```
 
-`--no-optional-locks` 避免和模型正在跑的 git 命令抢锁。退出码非 0 或输出为空则视为 detached，`getGitBranch()` 的约定是：不在仓库中返回 `null`，detached 返回字符串 `"detached"`。页脚（`modes/interactive/components/footer.ts`）只展示这个缓存值。
+`status === 0` 且 `stdout.trim()` 非空时返回分支名。否则返回 `null`。调用方在 `findGitPaths` 非空且分支为 `null` 时显示字符串 `"detached"`。测试注入 `exec`，不依赖本机仓库。
 
-`FooterDataProvider` 监视 `HEAD` 和 reftable。变更后 500ms 去抖再异步刷新。刷新进行中又有事件则记 `refreshPending`，避免重叠的 git 进程。WSL 访问 `/mnt/<盘符>` 时 `fs.watch` 不可靠，`shouldPollGitHead` 改为轮询。`setCwd` 拆掉旧 watcher 再按新路径安装。`dispose` 必须清 timer 和 watcher。
+### 变更队列
 
-扩展通过 `ReadonlyFooterDataProvider` 读 `getGitBranch()`、`onBranchChange` 和 `getExtensionStatuses()`。上下文用量不在这里，而在 session 的 usage 上。
-
-```mermaid
-flowchart LR
-  cwd[会话 cwd] --> find[findGitPaths]
-  find --> head[HEAD 文件或 reftable]
-  head --> watch[watch 或 WSL 轮询]
-  watch --> git[git symbolic-ref HEAD]
-  git --> cache[cachedBranch]
-  cache --> footer[页脚]
-  cache --> ext[扩展只读接口]
+```ts
+export class FileMutationQueue {
+  constructor(cwd: string);
+  run<T>(fn: () => Promise<T>): Promise<T>;
+}
 ```
 
-### Worktree 与上下文
+同一个 `FileMutationQueue` 实例上的 `run` 串成链。`createDefaultTools` 为每个 cwd 建一个队列，write 和 edit 的 `execute` 包在 `queue.run` 里。read、grep、find、ls、bash 不使用队列。bash 用 `executionMode: "sequential"`，因此只要这一批里有 bash，agent-core 会把整批改成串行。这是相对上游的收紧。
 
-`findShadowedContextFile` 只在一种情况下去掉主仓的上下文文件：当前目录在 linked worktree 里，worktree 根已经有自己的 `AGENTS.md`（或同级候选名），并且 worktree 根是主仓根的子孙目录。典型布局是主仓里的 `worktrees/feat`。`git worktree add ../feat` 这种与主仓并列的路径不是子孙，不去重，祖先遍历也不会把主仓算进来。
+### 路径约束
 
-比较用的是目录的 realpath，不是文件的。worktree 的 `AGENTS.md` 若是指向主仓文件的符号链接，仍然只加载 worktree 这一份路径，避免同一 inode 出现两次。
+所有 `path` 参数先 `path.resolve(cwd, input)`。结果必须等于 cwd 或以 `cwd + path.sep` 开头。否则抛 `Error("path escapes cwd")`。不要跟随符号链接走出 cwd 之后再写。读可以 `realpath`，若 realpath 走出 cwd，同样抛错。
 
-`collectAncestorAgentsSkillDirs` 用更粗的 `findGitRepoRoot`：向上看到 `.git`（文件或目录）就停。它不解析 `commondir`。因此 skill 扫描不会爬出仓库去读父仓库的 `.agents/skills`，但也不会像 context file 那样做内容级去重。两套 git 探测不要合成一个函数，它们的停止条件不同。
+edit 的替换次数不是 1 时抛错，文件不写。`oldText === ""` 抛错。write 使用 `fs.writeFile`，父目录不存在则 `mkdir` 递归创建。
 
-### 装包用的 git
+bash 不走 shell 字符串拼接以外的检查：`spawn(shell, ["-c", command], { cwd, signal })`。`shell` 在 win32 上是 `powershell.exe`，否则是 `bash`。超时 120 秒，到点 kill 并抛错。stdout 和 stderr 合并后交给 `truncateHead`。退出码非 0 时抛 `Error`，消息里带退出码和截断后的输出，让循环把它变成 `isError`。
 
-`parseGitUrl`（`utils/git.ts`）接受带 `git:` 前缀的历史缩写，以及不带前缀的 `http(s)`、`ssh`、`git://`。SCP 形式 `git@host:path` 会被规范化成可 `git clone` 的 URL，ref 后缀和 clone URL 分开。`PackageManager.installGit`：
+## 方案
 
-1. 目标目录已存在：对指定 ref `fetch`，或检查是否有更新。
-2. 不存在：`git clone <repo> <targetDir>`，有 ref 再 `git checkout <ref>`。
-3. 若克隆结果含 `package.json`，在该目录安装依赖。
-4. 任何一步失败就删掉目标目录，避免半截 checkout 被下次当成已安装。
+`createDefaultTools` 的返回顺序固定为 read、write、edit、grep、find、ls、bash。`label` 用首字母大写的名字。`description` 各用一句话，测试不断言文案，只断言 `name`。
 
-这和用户项目的 worktree 无关。手搓 M4 可以不实现包管理器。若 M3 的 skill 只从本地目录加载，`installGit` 整段都可以推迟。
+grep 用逐文件读取加 `RegExp`，默认忽略 `node_modules` 和 `.git` 目录。不要调用系统 `rg`，否则 CI 机器没有 ripgrep 时测试失败。find 按文件名的子串匹配，`pattern` 不是正则。ls 只列一层，不递归。
 
-### 会话 cwd
+worktree 去重不在本包做。本包只导出：
 
-会话 header 记录 `cwd`。恢复时如果目录没了，`session-cwd.ts` 的 `MissingSessionCwdError` 让交互模式提示用户，而不是在错误的目录里继续改文件。`FooterDataProvider.setCwd` 和工具的 cwd 必须一起换。模型看到的 `cwd` 段（system prompt 最后附近）应使用正斜杠，和 `buildSystemPromptSections` 里 `cwd.replace(/\\/g, "/")` 一致。
+```ts
+export function shadowedContextFile(paths: GitPaths | null, worktreeContextBasename: string): string | undefined
+```
+
+当 `paths` 存在、`commonGitDir` 不是 `repoDir` 下的 `.git` 目录（说明是 linked worktree）、且 `repoDir` 位于 `dirname(commonGitDir)` 之内时，返回 `path.join(dirname(commonGitDir), worktreeContextBasename)`。否则 `undefined`。`wire.ts` 把这个返回值传给 `loadProjectContextFiles` 的 `shadowedPath`。basename 用 worktree 根上实际加载到的那个文件名。M4 测试只断言这个函数的返回路径，不断言 prompt。
 
 ## 备选方案
 
 | 方案 | 放弃原因 |
 |---|---|
-| 用 libgit2 读分支和状态 | 上游用 `git` 可执行文件加 `HEAD` 监视，避免把对象库绑进进程。分支名只是 UI 事实，不值得引入原生依赖。 |
-| 专用 `git_status` / `git_commit` 工具 | 上游把这类操作留在 bash。专用工具要复制暂存区、钩子、签名和编辑器，和「手搓最小仓库能力」不符。 |
-| 每个任务自动 `git worktree add` | durable 的例子说明这是隔离策略，不是 coding-agent 的循环。自动 worktree 会留下需要打扫的目录，也应单独设计。 |
-| 解析 `.git/HEAD` 文本得到分支 | worktree、packed-refs 和 reftable 会让文本解析分叉。`symbolic-ref` 已经处理这些情况，detached 时以非 0 退出，语义清楚。 |
+| libgit2 | 上游用 git 可执行文件。分支只是 UI 数据 |
+| 解析 `HEAD` 文本 | worktree 和 reftable 会分叉。`symbolic-ref` 失败即 detached |
+| bash 与 edit 完全并行 | 上游允许。手搓把 bash 标成 sequential，避免测试成为时间竞赛 |
 
 ## 横切关注点
 
-- **错误**：git 不在 `PATH` 上时分支是 `null`，工具循环继续。bash 里 git 失败要作为 `isError` 的 tool result 返回，不要抛出进程级异常。
-- **并发**：文件变更队列和 bash 的关系要写进测试。至少保证两个 edit 的 `execute` 不会重叠。`refreshGitBranchAsync` 用 `refreshInFlight` 合并并发的文件系统事件。
-- **持久化**：分支名不写入会话。它是 cwd 的实时属性。文件修改通过 write/edit 落在工作区，通过 tool result 落在 JSONL。两者不是一个事务：工具已把文件写完、进程在 `message_end` 前死亡时，工作区脏、会话里可能还没有这条结果。恢复修补见压缩文档，不要在 git 层回滚用户文件。
-- **锁**：观察分支时使用 `--no-optional-locks`。不要为了显示分支运行会写 `index.lock` 的命令。
+- **错误**：git 不在 `PATH` 时 `resolveBranch` 返回 `null`，不抛到进程外。工具错误变成 tool result。
+- **并发**：`FileMutationQueue` 用一个 `Promise` 链，不用布尔锁。测试里两个 `run` 的开始时间必须满足第二个的 fn 在第一个 fn resolve 之后才开始。
+- **持久化**：文件写入和 JSONL 的 tool result 不是一个事务。进程死在 write 之后、`message_end` 之前时，工作区已改、会话可能还没有结果。恢复时 M2 会补错误 tool result。不要在工具里回滚文件。
+- **锁**：分支命令带 `--no-optional-locks`。不要为了显示分支运行 `git status`。
 
 ## 手搓实现笔记
 
-1. 先做 `read` 和 `bash`，cwd 固定为会话目录。用夹具仓库跑 `git status`，断言输出被截断函数包过。
-2. 加 `edit` / `write` 和按绝对路径串行的变更队列。测试两个并行调用的开始时间重叠与否。
-3. 实现 `findGitPaths` 的两种 `.git` 形态。夹具不用真的 `git worktree add`：写一个 `.git` 文件，内容为 `gitdir: ...`，并在目标处放 `HEAD` 和可选的 `commondir`。上游 `resource-loader` 测试就是这么做的。
-4. `getGitBranch` 可以在测试里注入执行函数，避免断言依赖本机分支名。
-5. 把 worktree 去重接到 M3 的 context 加载。没有 M3 时，这一步只断言被抑制的路径集合。
-6. `grep` / `find` / `ls` 可以后补。它们减少模型滥用 bash，但不改变架构。
+按总览 M4 的 6 步。`git-paths.test.ts` 的 worktree 夹具手写文件：
 
-不要在 M4 实现 `installGit`。包来源解析是网关和 skill 分发的问题，和「agent 怎么改当前仓库」无关。
+```text
+repo/.git/HEAD                         # 内容 "ref: refs/heads/main"
+repo/.git/worktrees/feat/HEAD
+repo/.git/worktrees/feat/commondir     # 内容 "../.."
+repo/worktrees/feat/.git               # 内容 "gitdir: <绝对或相对路径>"
+```
+
+这和上游 `resource-loader` 测试的骨架相同，不调用 `git worktree add`。
